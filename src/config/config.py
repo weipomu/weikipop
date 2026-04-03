@@ -21,6 +21,7 @@ class Config:
             'hotkey': 'alt',
             'scan_region': '0',
             'max_lookup_length': 25,
+            'max_dictionaries_per_word': 1,
             'glens_low_bandwidth': False,
             'ocr_provider': 'meikiocr (local)',
             'auto_scan_mode': True,

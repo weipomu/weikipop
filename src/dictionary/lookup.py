@@ -569,7 +569,16 @@ class Lookup(threading.Thread):
         )
 
         results = []
-        for d in sorted_entries[:MAX_DICT_ENTRIES]:
+        max_dicts_per_word = max(1, int(getattr(config, 'max_dictionaries_per_word', 1)))
+        word_counts: Dict[Tuple[str, str], int] = {}
+
+        for d in sorted_entries:
+            word_key = (d['written_form'], d['reading'])
+            seen = word_counts.get(word_key, 0)
+            if seen >= max_dicts_per_word:
+                continue
+
+            word_counts[word_key] = seen + 1
             results.append(DictionaryEntry(
                 id=d['id'],
                 written_form=d['written_form'],
@@ -582,6 +591,9 @@ class Lookup(threading.Thread):
                 dictionary_name=d['dictionary_name'],
                 dictionary_id=d['dictionary_id'],
             ))
+
+            if len(results) >= MAX_DICT_ENTRIES:
+                break
         return results
 
     def _calculate_priority(

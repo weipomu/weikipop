@@ -177,6 +177,15 @@ class SettingsDialog(QDialog):
         self.max_lookup_spin.setValue(config.max_lookup_length)
         core_layout.addRow("Max Lookup Length:", self.max_lookup_spin)
 
+        self.max_dicts_per_word_spin = QSpinBox()
+        self.max_dicts_per_word_spin.setRange(1, 20)
+        self.max_dicts_per_word_spin.setValue(getattr(config, 'max_dictionaries_per_word', 1))
+        self.max_dicts_per_word_spin.setToolTip(
+            "Limits how many dictionary sources can be shown for the same word in one lookup.\n"
+            "1 shows only the highest-priority dictionary."
+        )
+        core_layout.addRow("Max Dictionaries per Word:", self.max_dicts_per_word_spin)
+
         if IS_WINDOWS:
             self.magpie_check = QCheckBox()
             self.magpie_check.setChecked(config.magpie_compatibility)
@@ -732,6 +741,7 @@ class SettingsDialog(QDialog):
         config.hotkey = self.hotkey_combo.currentText()
         config.glens_low_bandwidth = self.glens_compression_check.isChecked()
         config.max_lookup_length = self.max_lookup_spin.value()
+        config.max_dictionaries_per_word = self.max_dicts_per_word_spin.value()
         config.auto_scan_mode = self.auto_scan_check.isChecked()
         config.auto_scan_interval_seconds = self.auto_scan_interval_spin.value()
         config.auto_scan_mode_lookups_without_hotkey = self.auto_scan_no_hotkey_check.isChecked()
@@ -781,6 +791,7 @@ class SettingsDialog(QDialog):
 
         self._sync_dictionary_sources_from_list()
         self.lookup.set_dictionary_sources(self._dictionary_sources)
+        self.lookup.clear_cache()
 
         config.save()
 
