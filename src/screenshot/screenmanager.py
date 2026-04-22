@@ -20,6 +20,11 @@ class ScreenManager(threading.Thread):
         self.last_screenshot = None
         self.last_mouse_pos = None
         self.input_loop = input_loop
+        # Persistent mss instance — created once in run() on the ScreenManager thread
+        # and reused for every grab. Creating a new mss.mss() per screenshot leaks GDI
+        # handles on Windows, which exhausts the system handle pool after extended use
+        # and crashes the process (or the whole desktop session).
+        self._sct = None
         if config.scan_region == "region":
             self.set_scan_region()
         else:
@@ -32,7 +37,9 @@ class ScreenManager(threading.Thread):
 
     def run(self):
         logger.debug("Screenshot thread started.")
-        while self.shared_state.running:
+        self._sct = mss.mss()
+        try:
+          while self.shared_state.running:
             try:
                 if config.auto_scan_mode and not config.is_enabled:
                     logger.debug(f"paused while auto mode")
@@ -78,12 +85,14 @@ class ScreenManager(threading.Thread):
             except Exception:
                 logger.exception("An unexpected error occurred in the screenshot loop. Continuing...")
                 self._sleep_and_handle_loop_exit(1)
+        finally:
+            self._sct.close()
+            self._sct = None
         logger.debug("Screenshot thread stopped.")
 
     def take_screenshot(self):
-        with mss.mss() as sct:
-            sct_img = sct.grab(self.monitor)
-            return sct_img
+        sct_img = self._sct.grab(self.monitor)
+        return sct_img
 
     def set_scan_region(self):
         scan_rect = RegionSelector.get_region()
