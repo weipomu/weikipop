@@ -10,7 +10,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QTimer, QPoint, QSize, Qt, pyqtSignal, QEvent
-from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QFontInfo
+from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QFontInfo, QTextDocument
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QApplication, QScrollArea
 
 from src.config.config import config, IS_MACOS
@@ -52,6 +52,16 @@ class Popup(QWidget):
         self._last_mouse_pos       = None   # throttle move_to calls
         self._last_html            = None   # skip redundant setText calls
         self._last_size            = None   # skip redundant resize calls
+        # How many more 16ms move-timer ticks to keep forcing scroll to top.
+        # Set whenever content changes; counts down to 0 so Qt layout settling
+        # can never leave blank space at the top of the popup.
+        self._scroll_reset_frames  = 0
+
+        # Lazy rendering — only the first batch of entry groups is rendered on
+        # initial display; remaining groups load as the user scrolls down.
+        self._lazy_pending_groups   = []    # groups not yet rendered
+        self._lazy_rendered_parts   = []    # accumulated HTML chunks
+        self._lazy_next_group_index = 0     # absolute group index for <hr> placement
         self._dismissed_by_click   = False
 
         self.shared_state = shared_state
@@ -72,6 +82,7 @@ class Popup(QWidget):
         self.probe_label = QLabel()
         self.probe_label.setWordWrap(True)
         self.probe_label.setTextFormat(Qt.TextFormat.RichText)
+        self.probe_label.hide()  # must be hidden — it has no parent so Qt would show it as a top-level window
 
         self.is_calibrated         = False
         self.header_chars_per_line = 50
@@ -103,13 +114,20 @@ class Popup(QWidget):
         self.display_label.setWordWrap(True)
         self.display_label.setTextFormat(Qt.TextFormat.RichText)
         self.display_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        # AlignTop: pin text to top of the label so it never floats to the
+        # vertical centre when the label is stretched to fill the popup height.
+        self.display_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.content_scroll = QScrollArea()
         self.content_scroll.setWidgetResizable(True)
         self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # AlignTop: content always starts at the top of the viewport instead of
+        # being vertically centred when it is shorter than the popup height.
+        self.content_scroll.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.content_scroll.setWidget(self.display_label)
         self.content_layout.addWidget(self.content_scroll)
+        self.content_scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_lazy_load)
 
         # Brief status message (e.g. "Mined!" / "Already in Anki") — hidden by default
         self.status_label = QLabel()
@@ -281,15 +299,23 @@ class Popup(QWidget):
         # Re-render only when content actually changes
         if latest_data and (latest_data    != self._last_latest_data or
                             latest_context != self._last_latest_context):
-            full_html, new_size = self._calculate_content_and_size(latest_data)
-            if full_html is not None and new_size is not None:
+            full_html = self._calculate_content(latest_data)
+            if full_html is not None:
                 if full_html != self._last_html:
                     self.display_label.setText(full_html)
                     self._last_html = full_html
                     self.content_scroll.verticalScrollBar().setValue(0)
+                    self._scroll_reset_frames = 8
+
+                # Fixed consistent size — same width and height regardless of
+                # how many definitions exist, so the popup never jumps around.
+                new_size = self._fixed_popup_size()
                 if new_size != self._last_size:
                     self.setFixedSize(new_size)
                     self._last_size = new_size
+                    if self.is_visible:
+                        mp = QCursor.pos()
+                        self.move_to(mp.x(), mp.y())
 
         self._last_latest_data    = latest_data
         self._last_latest_context = latest_context
@@ -373,6 +399,12 @@ class Popup(QWidget):
         if should_show and not self._dismissed_by_click:
             self.show_popup()
             if self.is_visible:
+                # Keep forcing scroll to top for a few frames after content changes
+                # so Qt's layout engine can never leave blank space at the top.
+                if self._scroll_reset_frames > 0:
+                    self.content_scroll.verticalScrollBar().setValue(0)
+                    self._scroll_reset_frames -= 1
+
                 mouse_pos = QCursor.pos()
                 mp = (mouse_pos.x(), mouse_pos.y())
                 lp = self._last_mouse_pos
@@ -380,6 +412,7 @@ class Popup(QWidget):
                     self._last_mouse_pos = mp
                     self.move_to(mp[0], mp[1])
         else:
+            self._scroll_reset_frames = 0
             self.hide_popup()
 
     def eventFilter(self, obj, event):
@@ -559,7 +592,12 @@ class Popup(QWidget):
             self.anki_presence_updated.emit(_mined_word, True)
         except Exception as e:
             logger.error(f"Failed to add note: {e}")
-            self.status_message_signal.emit(f"Error: {e}")
+            s = str(e)
+            if any(x in s for x in ("10061", "Connection refused", "Max retries",
+                                     "NewConnectionError", "Failed to establish")):
+                self.status_message_signal.emit("Error: Anki not running")
+            else:
+                self.status_message_signal.emit("Error: could not add note")
 
     def _append_mining_log(self, entry: DictionaryEntry, ctx: Dict[str, Any], note: Dict[str, Any], note_id: int):
         try:
@@ -694,43 +732,35 @@ class Popup(QWidget):
                            f'{full_def_html}</span>')
         return senses_html, max_ratio
 
-    def _calculate_content_and_size(self, entries) -> tuple:
-        if not self.is_calibrated or not entries:
-            return None, None
+    # How many word/reading groups to render on first display, and per scroll trigger.
+    _INITIAL_RENDER_GROUPS = 2
+    _GROUPS_PER_LOAD = 3
 
-        all_html_parts = []
-        max_ratio = 0.0
+    def _render_groups_to_html(self, groups: list, start_index: int = 0) -> tuple:
+        """Render a list of entry groups to an HTML string.
+        start_index is the absolute group index of groups[0], used only to decide
+        whether to prepend a <hr> separator before the first group.
+        Returns (html_string, max_ratio)."""
+        html_parts = []
+        max_ratio  = 0.0
 
-        # Group consecutive DictionaryEntries that share the same (written_form, reading)
-        # so multiple dictionaries for one word are rendered as a single combined block.
-        groups = []
-        for entry in entries:
-            if isinstance(entry, KanjiEntry):
-                groups.append(entry)
-                continue
-            word_key = (entry.written_form, entry.reading)
-            if groups and isinstance(groups[-1], list) and groups[-1][0] == word_key:
-                groups[-1][1].append(entry)
-            else:
-                groups.append([word_key, [entry]])
-
-        for g_idx, group in enumerate(groups):
+        for i, group in enumerate(groups):
+            g_idx = start_index + i
             if g_idx > 0:
-                all_html_parts.append('<hr style="margin-top:0;margin-bottom:0;">')
+                html_parts.append('<hr style="margin-top:0;margin-bottom:0;">')
 
             # ── Kanji entry ──────────────────────────────────────────────
             if isinstance(group, KanjiEntry):
                 defn = ', '.join(group.meanings) if (config.show_examples or config.show_components) else '[字]'
                 calc = f"{group.character} {', '.join(group.readings)} {defn}"
                 max_ratio = max(max_ratio, len(calc) / self.header_chars_per_line, 0.7)
-                all_html_parts.append(self._render_kanji_entry(group))
+                html_parts.append(self._render_kanji_entry(group))
                 continue
 
             # ── Dictionary entry group ───────────────────────────────────
             word_key, dict_entries = group
             first_entry = dict_entries[0]
 
-            # Shared header (word + reading + deconjugation + frequency)
             header_calc = first_entry.written_form or ""
             if first_entry.reading:
                 header_calc += f" [{first_entry.reading}]"
@@ -758,13 +788,10 @@ class Popup(QWidget):
                     f'font-size:{config.font_size_definitions - 2}px;opacity:0.6;">#{first_entry.freq}</span>'
                 )
 
-            # Build combined definitions block
             multi_dict = len(dict_entries) > 1
             body_parts = []
             for entry in dict_entries:
                 if multi_dict:
-                    # Render definitions without their own leading <br> —
-                    # we control exactly where each block starts.
                     senses_html, max_ratio = self._render_senses(entry, max_ratio, inline_only=True)
                     dict_name = getattr(entry, 'dictionary_name', '') or 'Dictionary'
                     dict_label = (
@@ -775,7 +802,6 @@ class Popup(QWidget):
                     body_parts.append(f'{dict_label}{senses_html}')
                 else:
                     senses_html, max_ratio = self._render_senses(entry, max_ratio)
-                    # Single dict: label stays in the header (legacy behaviour)
                     if getattr(entry, 'dictionary_name', ''):
                         header_html += (
                             f' <span style="color:{config.color_foreground};'
@@ -785,34 +811,110 @@ class Popup(QWidget):
                     body_parts.append(senses_html)
 
             if multi_dict:
-                # Use <p> tags — Qt's rich text renderer guarantees these are
-                # block-level, unlike <br> which gets absorbed into inline flow.
                 p_header = f'<p style="margin:0;padding:0;">{header_html}</p>'
                 p_dicts = ''.join(
                     f'<p style="margin:0;padding:0;margin-top:3px;">{part}</p>'
                     for part in body_parts
                 )
-                all_html_parts.append(p_header + p_dicts)
+                html_parts.append(p_header + p_dicts)
             else:
                 combined_body = body_parts[0] if body_parts else ''
-                all_html_parts.append(f"{header_html}{combined_body}")
+                html_parts.append(f"{header_html}{combined_body}")
 
-        # Compute size
-        optimal_w = max(self.max_content_width * min(1.0, max_ratio), 200)
-        full_html  = "".join(all_html_parts)
-        self.probe_label.setText(full_html)
-        content_h = self.probe_label.heightForWidth(int(optimal_w))
+        return "".join(html_parts), max_ratio
 
+    def _measure_html_height(self, html: str, width: int) -> int:
+        """Measure the pixel height needed to render html at the given width.
+        Uses a QTextDocument (same engine as QLabel) — synchronous, accurate,
+        and has zero side-effects on any visible widget or scroll position."""
+        doc = QTextDocument()
+        doc.setDefaultFont(QFont(config.font_family))
+        doc.setHtml(html)
+        doc.setTextWidth(width)
+        return int(doc.size().height())
+
+    def _fixed_popup_size(self) -> QSize:
+        """Return the one fixed size used for every popup regardless of content."""
         margins  = self.content_layout.contentsMargins()
-        spacing  = self.content_layout.spacing()
         border   = 1
-        h_pad = margins.left() + margins.right() + border * 2
-        v_pad = margins.top() + margins.bottom() + border * 2 + MINE_BAR_HEIGHT + spacing
+        h_pad    = margins.left() + margins.right() + border * 2
+        v_pad    = margins.top() + margins.bottom() + border * 2 + MINE_BAR_HEIGHT + self.content_layout.spacing()
+        screen   = QApplication.primaryScreen()
+        screen_w = screen.geometry().width()  if screen else 1920
+        screen_h = screen.geometry().height() if screen else 1080
+        # Width: 30% of screen width — readable without covering too much screen.
+        # Height: fixed comfortable reading height — scroll handles overflow.
+        w = int(screen_w * 0.30)
+        h = (min(int(screen_h * 0.22), 220)
+             if config.compact_mode
+             else min(int(screen_h * 0.45), 420))
+        return QSize(w + h_pad, h + v_pad)
 
-        max_height = int((QApplication.primaryScreen().geometry().height() if QApplication.primaryScreen() else 1080) * 0.55)
-        target_height = min(content_h + v_pad, max_height)
-        size = QSize(int(optimal_w) + h_pad, target_height)
-        return full_html, size
+    def _calculate_content(self, entries) -> 'str | None':
+        """Build and return the initial HTML to display.  Only the first
+        _INITIAL_RENDER_GROUPS groups are rendered — the rest load as the
+        user scrolls via _on_scroll_lazy_load."""
+        if not self.is_calibrated or not entries:
+            self._lazy_pending_groups = []
+            self._lazy_rendered_parts = []
+            return None
+
+        # Build display groups: entries sharing (written_form, reading) merged.
+        all_groups = []
+        for entry in entries:
+            if isinstance(entry, KanjiEntry):
+                all_groups.append(entry)
+                continue
+            word_key = (entry.written_form, entry.reading)
+            if all_groups and isinstance(all_groups[-1], list) and all_groups[-1][0] == word_key:
+                all_groups[-1][1].append(entry)
+            else:
+                all_groups.append([word_key, [entry]])
+
+        initial_groups              = all_groups[:self._INITIAL_RENDER_GROUPS]
+        self._lazy_pending_groups   = all_groups[self._INITIAL_RENDER_GROUPS:]
+        self._lazy_next_group_index = len(initial_groups)
+
+        initial_html, _ = self._render_groups_to_html(initial_groups, start_index=0)
+        self._lazy_rendered_parts   = [initial_html]
+        return initial_html
+
+    # ------------------------------------------------------------------ #
+    #  Lazy entry loading                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _on_scroll_lazy_load(self, value: int):
+        """Triggered by the scrollbar — appends the next batch of entry groups
+        when the user has scrolled at least 70% of the way through current content."""
+        if not self._lazy_pending_groups:
+            return
+        sb = self.content_scroll.verticalScrollBar()
+        if sb.maximum() > 0 and value >= sb.maximum() * 0.70:
+            self._append_next_lazy_batch()
+
+    def _append_next_lazy_batch(self):
+        """Render the next _GROUPS_PER_LOAD pending groups and append them
+        without disturbing the user's current scroll position."""
+        if not self._lazy_pending_groups:
+            return
+        sb        = self.content_scroll.verticalScrollBar()
+        saved_pos = sb.value()
+
+        batch                     = self._lazy_pending_groups[:self._GROUPS_PER_LOAD]
+        self._lazy_pending_groups = self._lazy_pending_groups[self._GROUPS_PER_LOAD:]
+
+        batch_html, _ = self._render_groups_to_html(
+            batch, start_index=self._lazy_next_group_index
+        )
+        self._lazy_next_group_index += len(batch)
+        self._lazy_rendered_parts.append(batch_html)
+
+        full_html       = "".join(self._lazy_rendered_parts)
+        self._last_html = full_html   # keep in sync so the 60ms timer doesn't re-render
+        self.display_label.setText(full_html)
+        # Restore position after Qt settles the layout — content above the
+        # saved position is unchanged so this keeps the view perfectly stable.
+        QTimer.singleShot(0, lambda pos=saved_pos: sb.setValue(pos))
 
     def _render_kanji_entry(self, entry: KanjiEntry) -> str:
         c_word = config.color_highlight_word
@@ -871,12 +973,14 @@ class Popup(QWidget):
         if IS_MACOS:
             self.raise_()
         self.is_visible = True
+        self.input_loop.suppress_scroll = True
 
     def hide_popup(self):
         if not self.is_visible:
             return
         self.hide()
         self.is_visible = False
+        self.input_loop.suppress_scroll = False
         self._last_presence_word = None  # re-check on next show, even same word
         QTimer.singleShot(50, self._release_lock_safely)
         self._restore_focus_on_mac()
@@ -949,6 +1053,7 @@ class Popup(QWidget):
         logger.debug("Popup: reapplying settings")
         self._apply_frame_stylesheet()
         self.is_calibrated = False
+        self._last_size = None   # force size recompute — compact mode may have changed
 
     # ------------------------------------------------------------------ #
     #  macOS focus management                                               #

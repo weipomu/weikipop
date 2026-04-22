@@ -30,6 +30,7 @@ class OcrProcessor(threading.Thread):
 
     def run(self):
         logger.debug("OCR thread started.")
+        consecutive_failures = 0
         while self.shared_state.running:
             try:
                 screenshot = self.shared_state.ocr_queue.get()
@@ -39,6 +40,7 @@ class OcrProcessor(threading.Thread):
 
                 start_time = time.perf_counter()
                 ocr_result = self.ocr_backend.scan(screenshot)
+                consecutive_failures = 0  # reset on any successful call
                 logger.info(
                     f"{self.ocr_backend.NAME} found {len(ocr_result) if ocr_result else 0} paragraphs in {(time.perf_counter() - start_time):.3f}s.")
                 self.shared_state.hit_scan_queue.put(ocr_result)
@@ -46,6 +48,17 @@ class OcrProcessor(threading.Thread):
                 self.shared_state.hit_scan_queue.trigger()
             except Exception:
                 logger.exception("An unexpected error occurred in the ocr loop. Continuing...")
+                consecutive_failures += 1
+                # Exponential backoff: 1s, 2s, 4s, 8s, 16s — prevents a crashing
+                # OCR backend (e.g. GPU OOM with local OCR) from pegging the CPU in
+                # a tight crash-restart loop that can take down the whole system.
+                backoff = min(2 ** (consecutive_failures - 1), 16)
+                if consecutive_failures > 1:
+                    logger.warning(
+                        f"OCR has failed {consecutive_failures} time(s) in a row. "
+                        f"Waiting {backoff}s before retrying..."
+                    )
+                time.sleep(backoff)
             finally:
                 if config.auto_scan_mode:
                     self.shared_state.screenshot_trigger_event.set()

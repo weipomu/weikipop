@@ -1,11 +1,11 @@
 # src/gui/settings_dialog.py
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QFontDatabase, QKeySequence
 from PyQt6.QtWidgets import (QWidget, QDialog, QFormLayout, QComboBox, QScrollArea,
                              QSpinBox, QCheckBox, QPushButton, QColorDialog, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QDialogButtonBox, QLabel, QSlider, QDoubleSpinBox,
                              QTabWidget, QSizePolicy, QFontComboBox, QLineEdit,
-                             QFileDialog, QMessageBox, QListWidget, QListWidgetItem)
+                             QFileDialog, QMessageBox, QListWidget, QListWidgetItem, QProgressBar)
 
 from src.dictionary.lookup import Lookup
 from src.config.config import config, APP_NAME, IS_WINDOWS
@@ -99,6 +99,51 @@ class ShortcutEdit(QLineEdit):
         else:
             super().mousePressEvent(event)
 
+class _DictWorker(QThread):
+    """Runs a blocking dictionary operation on a background thread.
+    - Lowers its OS thread priority so heavy dict processing does not starve
+      the cursor, compositor, or UI event loop for CPU time.
+    - Emits progress(current, total, message) as work proceeds so the UI can
+      show a live progress bar.
+    - Emits finished(result) on the Qt main thread when done."""
+    finished = pyqtSignal(object)
+    progress = pyqtSignal(int, int, str)   # current, total, message
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn    = fn
+        self._args  = args
+        self._kwargs = kwargs
+
+    def run(self):
+        # Lower OS thread priority so other processes (cursor, DWM, etc.) keep
+        # getting CPU time even when the dictionary load is pegging a core.
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.GetCurrentThread()
+            # THREAD_PRIORITY_LOWEST = -2
+            ctypes.windll.kernel32.SetThreadPriority(handle, -2)
+        except Exception:
+            try:
+                import os
+                os.nice(10)      # Linux / macOS fallback
+            except Exception:
+                pass
+
+        try:
+            # Inject progress_cb so the function can report its own progress.
+            result = self._fn(*self._args, progress_cb=self.progress.emit, **self._kwargs)
+        except TypeError:
+            # Function signature doesn't accept progress_cb — call without it.
+            try:
+                result = self._fn(*self._args, **self._kwargs)
+            except Exception as exc:
+                result = {'_worker_error': str(exc)}
+        except Exception as exc:
+            result = {'_worker_error': str(exc)}
+        self.finished.emit(result)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, ocr_processor: OcrProcessor, popup_window: Popup, input_loop: InputLoop, lookup: Lookup,
                  tray_icon, parent=None):
@@ -108,6 +153,7 @@ class SettingsDialog(QDialog):
         self.input_loop = input_loop
         self.tray_icon = tray_icon
         self.lookup = lookup
+        self._dict_worker: _DictWorker | None = None  # keeps background worker alive
 
         self.setWindowFlags(
             self.windowFlags() |
@@ -528,23 +574,39 @@ class SettingsDialog(QDialog):
         self.tab_dictionaries_layout.addWidget(self.dictionary_list)
 
         dict_btn_row = QHBoxLayout()
-        import_btn = QPushButton("Import Dictionary Files…")
-        import_btn.clicked.connect(self._import_dictionaries)
+        self.import_btn = QPushButton("Import Dictionary Files…")
+        self.import_btn.clicked.connect(self._import_dictionaries)
         up_btn = QPushButton("Move Up")
         up_btn.clicked.connect(self._move_dictionary_up)
         down_btn = QPushButton("Move Down")
         down_btn.clicked.connect(self._move_dictionary_down)
-        remove_btn = QPushButton("Delete…")
-        remove_btn.clicked.connect(self._remove_dictionary)
+        self.remove_btn = QPushButton("Delete…")
+        self.remove_btn.clicked.connect(self._remove_dictionary)
 
-        dict_btn_row.addWidget(import_btn)
+        dict_btn_row.addWidget(self.import_btn)
         dict_btn_row.addWidget(up_btn)
         dict_btn_row.addWidget(down_btn)
-        dict_btn_row.addWidget(remove_btn)
+        dict_btn_row.addWidget(self.remove_btn)
         self.tab_dictionaries_layout.addLayout(dict_btn_row)
+
+        # Status label + progress bar shown during background operations
+        self.dict_status_label = QLabel("")
+        self.dict_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dict_status_label.hide()
+        self.tab_dictionaries_layout.addWidget(self.dict_status_label)
+
+        self.dict_progress_bar = QProgressBar()
+        self.dict_progress_bar.setRange(0, 100)
+        self.dict_progress_bar.setValue(0)
+        self.dict_progress_bar.setTextVisible(True)
+        self.dict_progress_bar.hide()
+        self.tab_dictionaries_layout.addWidget(self.dict_progress_bar)
 
         self._dictionary_sources = self.lookup.get_dictionary_sources()
         self._refresh_dictionary_list()
+        # Track whether the user has made any dictionary changes that require a reload
+        self._dictionaries_modified = False
+        self.dictionary_list.itemChanged.connect(self._on_dictionary_item_changed)
         self.tab_dictionaries_layout.addStretch()
 
         # Add tabs to main layout — each wrapped in a scroll area
@@ -650,6 +712,7 @@ class SettingsDialog(QDialog):
             self._mark_as_custom()
 
     def _refresh_dictionary_list(self):
+        self.dictionary_list.blockSignals(True)
         self.dictionary_list.clear()
         for source in sorted(self._dictionary_sources, key=lambda s: int(s.get('priority', 0))):
             label = source.get('name', 'Dictionary')
@@ -660,6 +723,7 @@ class SettingsDialog(QDialog):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if source.get('enabled', True) else Qt.CheckState.Unchecked)
             self.dictionary_list.addItem(item)
+        self.dictionary_list.blockSignals(False)
 
     def _sync_dictionary_sources_from_list(self):
         synced = []
@@ -671,6 +735,32 @@ class SettingsDialog(QDialog):
             synced.append(source)
         self._dictionary_sources = synced
 
+    # ------------------------------------------------------------------ #
+    #  Dictionary background-worker helpers                                #
+    # ------------------------------------------------------------------ #
+
+    def _set_dict_ui_busy(self, busy: bool, message: str = ""):
+        """Disable/enable dict buttons and show/hide the status label + progress bar."""
+        self.import_btn.setEnabled(not busy)
+        self.remove_btn.setEnabled(not busy)
+        if busy:
+            self.dict_status_label.setText(message)
+            self.dict_status_label.show()
+            self.dict_progress_bar.setValue(0)
+            self.dict_progress_bar.show()
+        else:
+            self.dict_status_label.hide()
+            self.dict_status_label.setText("")
+            self.dict_progress_bar.hide()
+            self.dict_progress_bar.setValue(0)
+
+    def _on_dict_progress(self, current: int, total: int, message: str):
+        """Slot called from _DictWorker.progress signal — updates progress bar and label."""
+        if total > 0:
+            self.dict_progress_bar.setValue(int(current * 100 / total))
+        if message:
+            self.dict_status_label.setText(message)
+
     def _import_dictionaries(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -681,8 +771,20 @@ class SettingsDialog(QDialog):
         if not paths:
             return
 
-        report = self.lookup.import_dictionary_files(paths)
+        self._set_dict_ui_busy(True, "Importing dictionaries, please wait…")
+        self._dict_worker = _DictWorker(self.lookup.import_dictionary_files, paths)
+        self._dict_worker.progress.connect(self._on_dict_progress)
+        self._dict_worker.finished.connect(self._on_import_done)
+        self._dict_worker.start()
+
+    def _on_import_done(self, report):
+        self._set_dict_ui_busy(False)
+        if isinstance(report, dict) and '_worker_error' in report:
+            QMessageBox.critical(self, 'Import error', report['_worker_error'])
+            return
+
         self._dictionary_sources = self.lookup.get_dictionary_sources()
+        self._dictionaries_modified = True
         self._refresh_dictionary_list()
 
         imported_count = len(report.get('imported', []))
@@ -694,6 +796,11 @@ class SettingsDialog(QDialog):
         else:
             QMessageBox.information(self, 'Dictionary import complete', f'Imported {imported_count} dictionaries.')
 
+    def _on_dictionary_item_changed(self, item):
+        """Called when a dictionary's checkbox is toggled in the list."""
+        self._dictionaries_modified = True
+        self._sync_dictionary_sources_from_list()
+
     def _move_dictionary_up(self):
         row = self.dictionary_list.currentRow()
         if row <= 0:
@@ -701,6 +808,7 @@ class SettingsDialog(QDialog):
         item = self.dictionary_list.takeItem(row)
         self.dictionary_list.insertItem(row - 1, item)
         self.dictionary_list.setCurrentRow(row - 1)
+        self._dictionaries_modified = True
         self._sync_dictionary_sources_from_list()
 
     def _move_dictionary_down(self):
@@ -710,6 +818,7 @@ class SettingsDialog(QDialog):
         item = self.dictionary_list.takeItem(row)
         self.dictionary_list.insertItem(row + 1, item)
         self.dictionary_list.setCurrentRow(row + 1)
+        self._dictionaries_modified = True
         self._sync_dictionary_sources_from_list()
 
     def _remove_dictionary(self):
@@ -735,7 +844,20 @@ class SettingsDialog(QDialog):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
-        success, err = self.lookup.delete_dictionary_source(source.get('id', ''))
+        source_id = source.get('id', '')
+        self._set_dict_ui_busy(True, f"Removing '{name}'…")
+        self._dict_worker = _DictWorker(self.lookup.delete_dictionary_source, source_id)
+        self._dict_worker.progress.connect(self._on_dict_progress)
+        self._dict_worker.finished.connect(self._on_remove_done)
+        self._dict_worker.start()
+
+    def _on_remove_done(self, result):
+        self._set_dict_ui_busy(False)
+        if isinstance(result, tuple):
+            success, err = result
+        else:
+            success, err = False, str(result)
+
         if not success:
             QMessageBox.warning(self, 'Dictionary deletion failed', err or 'Unknown error')
             return
@@ -800,19 +922,29 @@ class SettingsDialog(QDialog):
             if combo.currentText()
         }
 
-        self._sync_dictionary_sources_from_list()
-        self.lookup.set_dictionary_sources(self._dictionary_sources)
-        self.lookup.clear_cache()
-
+        # Only re-save and reload dictionary sources when the user actually changed
+        # something in the Dictionaries tab (reorder, toggle enabled, import, delete).
+        # The reload is the expensive part — run it in a background thread so the
+        # settings dialog closes immediately without freezing the UI.
         config.save()
-
-        # Tell the live components to re-apply settings
         self.input_loop.reapply_settings()
         self.popup_window.reapply_settings()
         self.tray_icon.reapply_settings()
         self.ocr_processor.shared_state.screenshot_trigger_event.set()
 
-        self.accept()
+        if self._dictionaries_modified:
+            self._sync_dictionary_sources_from_list()
+            sources_snapshot = list(self._dictionary_sources)
+            self.accept()   # close dialog NOW — dict reload happens in background
+
+            def _reload(sources, progress_cb=None):
+                self.lookup.set_dictionary_sources(sources, progress_cb=progress_cb)
+                self.lookup.clear_cache()
+
+            self._dict_worker = _DictWorker(_reload, sources_snapshot)
+            self._dict_worker.start()
+        else:
+            self.accept()
 
     MEIKIPOP_SOURCE_FIELDS = [
         "",
@@ -862,7 +994,18 @@ class SettingsDialog(QDialog):
             self._update_field_map_rows(self.anki_model_combo.currentText())
             self.anki_ping_label.setText("Status: connected")
         except Exception as e:
-            self.anki_ping_label.setText(f"Status: error — {e}")
+            self.anki_ping_label.setText(self._anki_friendly_error(e))
+
+    @staticmethod
+    def _anki_friendly_error(e: Exception) -> str:
+        """Return a short human-readable Anki error instead of a raw exception."""
+        s = str(e)
+        if any(x in s for x in ("10061", "Connection refused", "Max retries",
+                                 "NewConnectionError", "Failed to establish")):
+            return "Status: Anki not running — open Anki with AnkiConnect installed"
+        if "10013" in s or "Permission" in s:
+            return "Status: permission denied — check AnkiConnect URL/port"
+        return f"Status: error — {e}"
 
     def _update_field_map_rows(self, model_name: str):
         while self.field_map_layout.rowCount():

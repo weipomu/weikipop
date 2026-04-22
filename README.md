@@ -5,6 +5,7 @@ weikipop is a desktop Japanese OCR lookup tool built on top of the original Meik
 It continuously or manually scans a screen region, performs OCR, and shows dictionary lookups in a popup. It also supports adding cards to Anki via AnkiConnect.
 
 <img width="1695" height="941" alt="image" src="https://github.com/user-attachments/assets/a6105d75-5556-4ea0-8eae-0a394fa52e3c" />
+<img width="369" height="439" alt="image" src="https://github.com/user-attachments/assets/7cbc8a7e-f1b1-4822-b8c8-cbba22de7740" />
 
 ## Features
 
@@ -87,10 +88,9 @@ This project is licensed under GPL-3.0. See [LICENSE](LICENSE).
 
 ## Credits
 
-- [rtr46](https://github.com/rtr46) for the original Meikipop project
+- [rtr46](https://github.com/rtr46) for the original Meikipop project, didn't properly fork when making this project and cannot change it now, really sorry!
 - [zurcGH](https://github.com/zurcGH) for Meikipop-Anki lineage
-- [kqq](https://cdn.discordapp.com/attachments/1466228750185398446/1483992942980108439/ezgif-22972d5fd21a86b6.gif?ex=69d06220&is=69cf10a0&hm=3170f8de6f98b4358268a5b598c98390ec1009ab31028eb18166a22a6748b991&) for being my first initial tester!
-- [busting chan](https://cdn.discordapp.com/attachments/1487214676713406616/1487613970683793499/image.png?ex=69d05f79&is=69cf0df9&hm=b3f2cacf2a76e07bcd735c2eb7c8bed646285f7ecb432179e3a35d5796df7305&)
+- [kqq](https://github.com/user-attachments/assets/8d1ebb4e-daeb-4bae-93cc-9ae4a78751df) for being my first initial tester!
 
 
 
