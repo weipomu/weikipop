@@ -28,6 +28,12 @@ DECONJUGATOR_PATH  = os.path.join(DATA_DIR, 'deconjugator.json')
 SYNTHETIC_ID_START = 10_000_000  # safely above any real JMdict seq number
 DEFAULT_FREQ       = 999_999
 
+# Optional JPDB frequency zip — place the file at this path before building to
+# get higher-quality per-(word, reading) frequency ranks in the output dictionary.
+# Download from: https://github.com/Kuuuube/yomitan-dictionaries
+# Overrides jiten.moe ranks where JPDB has data; jiten.moe fills in the rest.
+JPDB_FREQ_ZIP      = os.path.join(DATA_DIR, '_Freq__JPDB.zip')
+
 URLS = {
     'jmdict_e':  'http://ftp.edrdg.org/pub/Nihongo/JMdict_e.gz',
     'kanjidic':  'http://www.edrdg.org/kanjidic/kanjidic2.xml.gz',
@@ -106,6 +112,70 @@ def load_freq_map(csv_bytes: bytes) -> dict:
             except ValueError:
                 pass
     print(f"  {len(result)} frequency entries loaded")
+    return result
+
+
+def load_jpdb_freq_map(zip_path: str) -> dict:
+    """Load JPDB frequency ranks from a Yomitan-format frequency zip.
+    Returns {(term, reading_or_empty): rank} using the same key shape as
+    load_freq_map so the two maps can be merged directly.
+    Only uses non-㋕ (word-level) entries; ignores pure kana-reading entries
+    since those are lower-quality fallbacks."""
+    import zipfile
+
+    def _parse_freq_value(raw):
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        if isinstance(raw, str):
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        if isinstance(raw, dict):
+            if 'value' in raw:
+                return int(raw['value'])
+            inner = raw.get('frequency')
+            if inner is not None:
+                return _parse_freq_value(inner)
+        return None
+
+    result: dict = {}
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            meta_files = sorted(
+                n for n in zf.namelist()
+                if re.match(r'term_meta_bank_\d+\.json', os.path.basename(n))
+            )
+            for meta_file in meta_files:
+                with zf.open(meta_file) as f:
+                    rows = json.loads(f.read().decode('utf-8'))
+                for row in rows:
+                    if len(row) < 3 or row[1] != 'freq':
+                        continue
+                    term = row[0]
+                    raw  = row[2]
+                    if isinstance(raw, dict) and 'reading' in raw:
+                        # {reading: "...", frequency: {value: N, displayValue: "N"}}
+                        # These are the high-quality word+reading entries — use them.
+                        reading  = raw['reading']
+                        rank_val = _parse_freq_value(raw.get('frequency'))
+                        if rank_val is None:
+                            continue
+                        # Skip ㋕ (kana-frequency) displayValue entries at this level
+                        display = (raw.get('frequency') or {}).get('displayValue', '')
+                        if '㋕' in str(display):
+                            continue
+                    else:
+                        # Bare {value: N, displayValue: "N㋕"} — pure kana-reading
+                        # frequency entry. These are less precise so we skip them
+                        # in favour of the word+reading entries above.
+                        continue
+                    key = (term, reading)
+                    if key not in result or rank_val < result[key]:
+                        result[key] = rank_val
+    except Exception as exc:
+        print(f"  WARNING: Could not load JPDB freq zip: {exc}")
+    print(f"  {len(result)} JPDB frequency entries loaded")
     return result
 
 
@@ -517,6 +587,20 @@ def main():
 
     print("\n[2/5] Parsing frequency list ...")
     freq_map = load_freq_map(freq_bytes)
+
+    # Merge JPDB frequencies on top of jiten.moe — JPDB has precise per-(word, reading)
+    # ranks (e.g. 歩く=208 vs 歩き=45295) which produces much better result ordering.
+    if os.path.exists(JPDB_FREQ_ZIP):
+        print(f"\n[2b/5] Merging JPDB frequency data from {JPDB_FREQ_ZIP} ...")
+        jpdb_map = load_jpdb_freq_map(JPDB_FREQ_ZIP)
+        overrides = 0
+        for key, rank in jpdb_map.items():
+            if key not in freq_map or rank < freq_map[key]:
+                freq_map[key] = rank
+                overrides += 1
+        print(f"  {overrides} entries updated with JPDB ranks")
+    else:
+        print(f"\n  (JPDB freq zip not found at {JPDB_FREQ_ZIP} — using jiten.moe only)")
 
     print("\n[3/5] Parsing JMdict_e ...")
     t0 = time.time()
