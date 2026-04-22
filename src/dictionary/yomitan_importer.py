@@ -1,6 +1,7 @@
 import json
 import pickle
 import re
+import time
 import zipfile
 from html import escape
 from collections import defaultdict
@@ -11,6 +12,18 @@ from src.dictionary.structured_content import handle_structured_content
 
 DEFAULT_FREQ = 999_999
 ID_NAMESPACE = 10_000_000
+
+
+def _throttled(iterable, work_ms: float = 2.0, sleep_ms: float = 8.0):
+    """Yield items while capping CPU to ~20% — work for 2ms then sleep 8ms."""
+    work_s  = work_ms  / 1000.0
+    sleep_s = sleep_ms / 1000.0
+    t = time.monotonic()
+    for item in iterable:
+        yield item
+        if time.monotonic() - t >= work_s:
+            time.sleep(sleep_s)
+            t = time.monotonic()
 
 
 def _extract_text(node) -> str:
@@ -128,7 +141,7 @@ def convert_yomitan_zip_to_payload(zip_path: str, dict_index: int = 0) -> Tuple[
 
     seq_groups = defaultdict(list)
     standalone_seq = -1
-    for row in rows:
+    for i, row in _throttled(enumerate(rows)):
         if len(row) < 6:
             continue
         seq = row[6] if len(row) > 6 else 0
@@ -145,7 +158,7 @@ def convert_yomitan_zip_to_payload(zip_path: str, dict_index: int = 0) -> Tuple[
     def freq_for(term: str, reading: str) -> int:
         return freq_map.get((term, reading), freq_map.get((term, ''), DEFAULT_FREQ))
 
-    for seq, group_rows in seq_groups.items():
+    for j, (seq, group_rows) in _throttled(enumerate(seq_groups.items())):
         if seq < 0:
             entry_id = id_base + (ID_NAMESPACE + seq)
         else:
