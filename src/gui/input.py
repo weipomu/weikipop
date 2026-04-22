@@ -16,7 +16,103 @@ elif IS_MACOS:
     import Quartz
     from AppKit import NSEvent
 else:
+    import ctypes
+    import ctypes.wintypes as _wintypes
     import keyboard
+
+    # Constants for WH_MOUSE_LL scroll suppression
+    _WH_MOUSE_LL    = 14
+    _WM_MOUSEWHEEL  = 0x020A
+    _WM_MOUSEHWHEEL = 0x020E
+    _LLMHF_INJECTED = 0x00000001
+
+    class _MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ('pt',          _wintypes.POINT),
+            ('mouseData',   _wintypes.DWORD),
+            ('flags',       _wintypes.DWORD),
+            ('time',        _wintypes.DWORD),
+            ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    _HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,   # LRESULT (pointer-sized on 64-bit)
+        ctypes.c_int,       # nCode
+        _wintypes.WPARAM,
+        _wintypes.LPARAM,
+    )
+
+    class _WindowsScrollHook:
+        """Suppression-only WH_MOUSE_LL hook.
+        Installed *before* pynput so the chain order is:
+          pynput (records delta) → our hook (suppresses app) → [app blocked]
+        Windows hooks are LIFO so last-installed = first-called; by blocking in
+        start() until our hook is live, pynput is guaranteed to be installed after
+        us and therefore called first."""
+
+        def __init__(self, input_loop):
+            self._input_loop   = input_loop
+            self._hook_handle  = None
+            self._proc         = None   # keep reference alive
+            self._thread       = None
+            self._ready        = threading.Event()
+
+        def start(self):
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="ScrollSuppressHook"
+            )
+            self._thread.start()
+            # Block until the hook is actually installed so pynput (started right
+            # after) ends up last-installed = first-called in the hook chain.
+            self._ready.wait(timeout=1.0)
+
+        def _run(self):
+            u32 = ctypes.windll.user32
+            # Declare proper 64-bit-safe types before any call.
+            u32.SetWindowsHookExW.restype  = ctypes.c_void_p
+            u32.SetWindowsHookExW.argtypes = [
+                ctypes.c_int, _HOOKPROC, ctypes.c_void_p, ctypes.c_ulong
+            ]
+            u32.CallNextHookEx.restype  = ctypes.c_ssize_t
+            u32.CallNextHookEx.argtypes = [
+                ctypes.c_void_p, ctypes.c_int,
+                _wintypes.WPARAM, _wintypes.LPARAM,
+            ]
+            u32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+
+            self._proc        = _HOOKPROC(self._callback)
+            self._hook_handle = u32.SetWindowsHookExW(
+                _WH_MOUSE_LL, self._proc, None, 0
+            )
+            self._ready.set()   # unblock start() regardless of success/failure
+
+            if not self._hook_handle:
+                logger.warning(
+                    "Could not install scroll suppression hook — "
+                    "popup scrolling works normally but other apps may also scroll."
+                )
+                return
+
+            msg = _wintypes.MSG()
+            while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u32.TranslateMessage(ctypes.byref(msg))
+                u32.DispatchMessageW(ctypes.byref(msg))
+            u32.UnhookWindowsHookEx(self._hook_handle)
+
+        def _callback(self, nCode, wParam, lParam):
+            try:
+                if nCode >= 0 and wParam in (_WM_MOUSEWHEEL, _WM_MOUSEHWHEEL):
+                    data = ctypes.cast(
+                        lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)
+                    ).contents
+                    if (not (data.flags & _LLMHF_INJECTED)
+                            and self._input_loop.suppress_scroll):
+                        return 1    # suppress: skip CallNextHookEx → app never sees it
+            except Exception:
+                pass    # never raise inside a low-level hook callback
+            return ctypes.windll.user32.CallNextHookEx(
+                self._hook_handle, nCode, wParam, lParam
+            )
 
 
 logger = logging.getLogger(__name__)
@@ -168,11 +264,24 @@ class InputLoop(threading.Thread):
         self.scroll_dy = 0
         self.scroll_lock = threading.Lock()
 
+        # When True, scroll events are suppressed at the OS level (Windows only) so
+        # other apps don't receive them while the popup is visible. Set by the popup.
+        self.suppress_scroll = False
+
         # Track mouse button states for mouse shortcuts
         self.mouse_buttons_pressed = set()
         self.mouse_button_lock = threading.Lock()
 
-        # Start mouse listener for scroll and click events
+        # On Windows: install the suppression hook *before* starting pynput's listener.
+        # This guarantees pynput ends up last-installed = first-called in the hook chain,
+        # so pynput records the scroll delta as normal and our hook suppresses downstream.
+        if not IS_LINUX and not IS_MACOS:
+            self._scroll_hook = _WindowsScrollHook(self)
+            self._scroll_hook.start()   # blocks until hook is live
+        else:
+            self._scroll_hook = None
+
+        # Start mouse listener for scroll and click events — unchanged from original.
         self.mouse_listener = mouse.Listener(
             on_scroll=self.on_scroll,
             on_click=self.on_click,
