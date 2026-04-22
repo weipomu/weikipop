@@ -6,6 +6,7 @@ import pickle
 import re
 import shutil
 import threading
+import time
 import uuid
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -52,6 +53,20 @@ class KanjiEntry:
     examples: List[Dict[str, str]]
 
 
+def _throttled(iterable, work_ms: float = 2.0, sleep_ms: float = 8.0):
+    """Yield items from iterable while capping CPU usage.
+    Works for work_ms then sleeps for sleep_ms — roughly 20% CPU regardless
+    of machine speed, keeping the cursor smooth during dictionary loading."""
+    work_s  = work_ms  / 1000.0
+    sleep_s = sleep_ms / 1000.0
+    t = time.monotonic()
+    for item in iterable:
+        yield item
+        if time.monotonic() - t >= work_s:
+            time.sleep(sleep_s)
+            t = time.monotonic()
+
+
 class Lookup(threading.Thread):
     def __init__(self, shared_state, popup_window):
         super().__init__(daemon=True, name="Lookup")
@@ -66,6 +81,11 @@ class Lookup(threading.Thread):
         # entry_id -> source metadata
         self.entry_sources: Dict[int, Dict[str, Any]] = {}
         self.primary_kanji_entries: Dict[str, Dict[str, Any]] = {}
+
+        # Cache loaded Dictionary objects by (path, mtime).  This avoids
+        # re-reading and re-unpickling unchanged files (e.g. the 65 MB main
+        # dict) on every import or settings-save that touches dictionaries.
+        self._dict_file_cache: Dict[str, tuple] = {}  # path -> (mtime, Dictionary)
 
         self.dictionary = Dictionary()
         self.lookup_cache: OrderedDict = OrderedDict()
@@ -112,7 +132,7 @@ class Lookup(threading.Thread):
             sources = self._default_dictionary_sources()
         return sorted(sources, key=lambda x: int(x.get('priority', 0)))
 
-    def set_dictionary_sources(self, sources: List[Dict[str, Any]]):
+    def set_dictionary_sources(self, sources: List[Dict[str, Any]], progress_cb=None):
         normalized = []
         for idx, source in enumerate(sources):
             normalized.append({
@@ -133,7 +153,7 @@ class Lookup(threading.Thread):
 
         config.dictionary_sources = normalized
         config.save()
-        self._load_configured_dictionaries()
+        self._load_configured_dictionaries(progress_cb=progress_cb)
 
     def delete_dictionary_source(self, source_id: str) -> Tuple[bool, str]:
         """Delete a dictionary source entry and its file when appropriate.
@@ -164,15 +184,18 @@ class Lookup(threading.Thread):
         self.set_dictionary_sources(remaining)
         return True, ''
 
-    def import_dictionary_files(self, file_paths: List[str]) -> Dict[str, Any]:
+    def import_dictionary_files(self, file_paths: List[str], progress_cb=None) -> Dict[str, Any]:
         report = {'imported': [], 'failed': [], 'skipped': []}
         if not file_paths:
             return report
 
         sources = self.get_dictionary_sources()
         existing_names = {s.get('name', '').lower(): s for s in sources}
+        n_files = len(file_paths)
 
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
+            if progress_cb:
+                progress_cb(i, n_files, f"Converting {Path(file_path).name}...")
             try:
                 path = Path(file_path)
                 if not path.exists():
@@ -215,7 +238,13 @@ class Lookup(threading.Thread):
             except Exception as exc:
                 report['failed'].append((file_path, str(exc)))
 
-        self.set_dictionary_sources(sources)
+        # Loading phase — pass progress through so the bar updates during the
+        # combined dictionary rebuild that follows the file conversion.
+        def _load_progress(current, total, msg):
+            if progress_cb:
+                progress_cb(current, total, msg or "Loading dictionaries...")
+
+        self.set_dictionary_sources(sources, progress_cb=_load_progress)
         return report
 
     @staticmethod
@@ -229,7 +258,7 @@ class Lookup(threading.Thread):
             counter += 1
         return candidate
 
-    def _load_configured_dictionaries(self):
+    def _load_configured_dictionaries(self, progress_cb=None):
         with self._dict_lock:
             sources = self.get_dictionary_sources()
 
@@ -244,47 +273,63 @@ class Lookup(threading.Thread):
             if not enabled_sources:
                 enabled_sources = self._default_dictionary_sources()
 
+            n_sources = len(enabled_sources)
+
             for source_index, source in enumerate(sorted(enabled_sources, key=lambda x: int(x.get('priority', 0)))):
                 path = source.get('path', '')
                 if not path or not os.path.exists(path):
                     logger.warning("Dictionary source '%s' missing path '%s'; skipping.", source.get('name'), path)
                     continue
 
-                dictionary = Dictionary()
-                if not dictionary.load_dictionary(path):
-                    logger.warning("Failed to load dictionary source '%s' from '%s'.", source.get('name'), path)
-                    continue
+                if progress_cb:
+                    progress_cb(source_index, n_sources, f"Loading '{source.get('name', 'Dictionary')}'...")
 
-                id_map: Dict[int, int] = {}
-                for old_entry_id, senses in dictionary.entries.items():
-                    new_entry_id = next_entry_id
-                    next_entry_id += 1
-                    id_map[old_entry_id] = new_entry_id
+                # Use cached Dictionary if the file hasn't changed — avoids
+                # re-reading and re-unpickling the full file (e.g. the 65 MB main
+                # dict) on every import or save that touches dictionaries.
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    mtime = 0.0
+                cached = self._dict_file_cache.get(path)
+                if cached and cached[0] == mtime:
+                    dictionary = cached[1]
+                    logger.debug("Using cached dictionary for '%s'", source.get('name'))
+                else:
+                    dictionary = Dictionary()
+                    if not dictionary.load_dictionary(path):
+                        logger.warning("Failed to load dictionary source '%s' from '%s'.", source.get('name'), path)
+                        continue
+                    self._dict_file_cache[path] = (mtime, dictionary)
 
-                    copied_senses = []
-                    for sense in senses:
-                        copied = dict(sense)
-                        copied.setdefault('source', source.get('name', 'Dictionary'))
-                        copied_senses.append(copied)
-                    combined_entries[new_entry_id] = copied_senses
-                    self.entry_sources[new_entry_id] = {
-                        'dictionary_name': source.get('name', 'Dictionary'),
-                        'dictionary_id': source.get('id', ''),
-                        'dictionary_priority': source_index,
-                    }
+                # Cache source metadata once — reused for every entry.
+                source_meta = {
+                    'dictionary_name':     source.get('name', 'Dictionary'),
+                    'dictionary_id':       source.get('id', ''),
+                    'dictionary_priority': source_index,
+                }
 
-                for surface, map_entries in dictionary.lookup_map.items():
+                # Build id_map in one comprehension and assign sequential global IDs.
+                entries_items = list(dictionary.entries.items())
+                id_start = next_entry_id
+                id_map = {old_id: id_start + i for i, (old_id, _) in enumerate(entries_items)}
+                next_entry_id += len(entries_items)
+
+                for i, (old_id, senses) in _throttled(enumerate(entries_items)):
+                    combined_entries[id_start + i] = senses
+                    self.entry_sources[id_start + i] = source_meta
+
+                for i, (surface, map_entries) in _throttled(enumerate(dictionary.lookup_map.items())):
                     bucket = combined_lookup_map.setdefault(surface, [])
                     for map_entry in map_entries:
-                        old_entry_id = map_entry[ENTRY_ID_INDEX]
-                        if old_entry_id not in id_map:
+                        new_eid = id_map.get(map_entry[ENTRY_ID_INDEX])
+                        if new_eid is None:
                             continue
-                        new_entry_id = id_map[old_entry_id]
                         bucket.append((
                             map_entry[WRITTEN_FORM_INDEX],
                             map_entry[READING_INDEX],
                             map_entry[FREQUENCY_INDEX],
-                            new_entry_id,
+                            new_eid,
                         ))
 
                 if not combined_kanji_entries and dictionary.kanji_entries:
@@ -292,6 +337,9 @@ class Lookup(threading.Thread):
 
                 if not combined_deconj_rules and dictionary.deconjugator_rules:
                     combined_deconj_rules = dictionary.deconjugator_rules
+
+                if progress_cb:
+                    progress_cb(source_index + 1, n_sources, "")
 
             self.dictionary.entries = combined_entries
             self.dictionary.lookup_map = combined_lookup_map
@@ -301,7 +349,6 @@ class Lookup(threading.Thread):
             self.dictionary._is_loaded = True
 
             if not self.dictionary.deconjugator_rules:
-                # Last-resort deconjugator fallback for imported dictionaries lacking rules.
                 try:
                     fallback = Dictionary()
                     if fallback.load_dictionary('dictionary.pkl'):
@@ -477,13 +524,31 @@ class Lookup(threading.Thread):
         return found_entries
 
     def _do_lookup(self, text: str) -> List[DictionaryEntry]:
-        """
-        Original local dictionary lookup - unchanged for performance
-        """
         collected: Dict[int, Tuple[tuple, Form, int]] = {}
         found_primary_match = False
+        first_match_len = 0
+        # Per-call cache for _get_map_entries — avoids repeated hira/kata
+        # conversions when the same form text appears across multiple forms.
+        _map_cache: Dict[str, List] = {}
+
+        def get_entries(form_text: str) -> List:
+            hit = _map_cache.get(form_text)
+            if hit is not None:
+                return hit
+            result = self._get_map_entries(form_text)
+            _map_cache[form_text] = result
+            return result
 
         for prefix_len in range(len(text), 0, -1):
+            # Skip this prefix if we already have a longer match and this prefix
+            # is too short to be meaningful — but only when the first match itself
+            # was longer than 1 char, so single-char words (particles, etc.) still
+            # appear when they are the only result.
+            if (found_primary_match
+                    and first_match_len > 1
+                    and prefix_len < max(first_match_len - 2, 2)):
+                break
+
             prefix = text[:prefix_len]
 
             forms = self.deconjugator.deconjugate(prefix)
@@ -492,7 +557,7 @@ class Lookup(threading.Thread):
             prefix_hits = []
 
             for form in forms:
-                map_entries = self._get_map_entries(form.text)
+                map_entries = get_entries(form.text)
                 if not map_entries:
                     continue
 
@@ -520,6 +585,7 @@ class Lookup(threading.Thread):
             if prefix_hits:
                 if not found_primary_match:
                     found_primary_match = True
+                    first_match_len = prefix_len
 
                 for map_entry, form in prefix_hits:
                     entry_id = map_entry[ENTRY_ID_INDEX]
@@ -603,8 +669,13 @@ class Lookup(threading.Thread):
         processed_groups = []
         for entries in word_groups.values():
             entries.sort(key=lambda x: x['dictionary_priority'])
-            best = entries[0]
-            processed_groups.append((-best['match_len'], -best['priority'], best['dictionary_priority'], entries))
+            # Rank this word group by the best priority available across ALL loaded
+            # dictionaries — not just the first-listed one.  This ensures that
+            # main dictionary.pkl frequency data (JPDB ranks) is always used for
+            # sorting 歩く vs 歩き etc. regardless of where the user placed it in
+            # the dictionary order settings.
+            rank_entry = max(entries, key=lambda x: (x['match_len'], x['priority']))
+            processed_groups.append((-rank_entry['match_len'], -rank_entry['priority'], entries[0]['dictionary_priority'], entries))
 
         processed_groups.sort(key=lambda x: (x[0], x[1], x[2]))
 
