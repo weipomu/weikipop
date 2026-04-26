@@ -52,6 +52,7 @@ class Popup(QWidget):
         self._last_mouse_pos       = None   # throttle move_to calls
         self._last_html            = None   # skip redundant setText calls
         self._last_size            = None   # skip redundant resize calls
+        self._cached_popup_size    = None   # cleared by reapply_settings
         # How many more 16ms move-timer ticks to keep forcing scroll to top.
         # Set whenever content changes; counts down to 0 so Qt layout settling
         # can never leave blank space at the top of the popup.
@@ -834,7 +835,11 @@ class Popup(QWidget):
         return int(doc.size().height())
 
     def _fixed_popup_size(self) -> QSize:
-        """Return the one fixed size used for every popup regardless of content."""
+        """Return the cached fixed size for the popup.
+        Recomputed only when reapply_settings() clears _last_size — not on every
+        timer tick — so dictionary_sources is never read at 60ms intervals."""
+        if self._cached_popup_size is not None:
+            return self._cached_popup_size
         margins  = self.content_layout.contentsMargins()
         border   = 1
         h_pad    = margins.left() + margins.right() + border * 2
@@ -842,13 +847,17 @@ class Popup(QWidget):
         screen   = QApplication.primaryScreen()
         screen_w = screen.geometry().width()  if screen else 1920
         screen_h = screen.geometry().height() if screen else 1080
-        # Width: 30% of screen width — readable without covering too much screen.
-        # Height: fixed comfortable reading height — scroll handles overflow.
         w = int(screen_w * 0.30)
-        h = (min(int(screen_h * 0.22), 220)
-             if config.compact_mode
-             else min(int(screen_h * 0.45), 420))
-        return QSize(w + h_pad, h + v_pad)
+        if config.compact_mode:
+            h = min(int(screen_h * 0.22), 220)
+        else:
+            h = min(int(screen_h * 0.45), 420)
+            sources = getattr(config, 'dictionary_sources', []) or []
+            enabled = [s for s in sources if s.get('enabled', True)]
+            if len(enabled) <= 1:
+                h = int(h * 0.60)
+        self._cached_popup_size = QSize(w + h_pad, h + v_pad)
+        return self._cached_popup_size
 
     def _calculate_content(self, entries) -> 'str | None':
         """Build and return the initial HTML to display.  Only the first
@@ -1053,7 +1062,8 @@ class Popup(QWidget):
         logger.debug("Popup: reapplying settings")
         self._apply_frame_stylesheet()
         self.is_calibrated = False
-        self._last_size = None   # force size recompute — compact mode may have changed
+        self._last_size = None
+        self._cached_popup_size = None   # recompute size — dict count or compact mode may have changed
 
     # ------------------------------------------------------------------ #
     #  macOS focus management                                               #
