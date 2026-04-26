@@ -25,7 +25,7 @@ class Config:
             'ocr_provider': 'meikiocr (local)',
             'auto_scan_mode': True,
             'auto_scan_mode_lookups_without_hotkey': False,
-            'auto_scan_interval_seconds': 1.2,
+            'auto_scan_interval_seconds': 1.0,
             'auto_scan_on_mouse_move': True,
             'magpie_compatibility': True,
             'show_keyboard_shortcuts': True,
