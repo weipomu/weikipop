@@ -8,8 +8,14 @@ from PIL import Image
 
 from src.config.config import config
 from src.gui.region_selector import RegionSelector
+from src.utils.screen_fingerprint import content_fingerprint
 
 logger = logging.getLogger(__name__) # Get the logger
+
+# Hard floor on auto-scan interval. A user-supplied 0 (or negative) value
+# otherwise lets the screenshot/OCR loop free-run and pin a CPU core.
+MIN_AUTO_SCAN_INTERVAL = 0.1
+
 
 class ScreenManager(threading.Thread):
     def __init__(self, shared_state, input_loop):
@@ -18,6 +24,7 @@ class ScreenManager(threading.Thread):
         self.monitor = None
         self.last_ocr_put_time = 0.0
         self.last_screenshot = None
+        self.last_screenshot_fp = None
         self.last_mouse_pos = None
         self.input_loop = input_loop
         # Persistent mss instance — created once in run() on the ScreenManager thread
@@ -50,12 +57,15 @@ class ScreenManager(threading.Thread):
                 if not self.shared_state.running: break
                 logger.debug("Screenshot: Triggered!")
 
-                # prevent multiple ocr runs during auto_scan_interval_seconds
+                # prevent multiple ocr runs during auto_scan_interval_seconds.
+                # Clamp the user-configured interval so a 0/negative value can
+                # never bypass the rate limit and free-run the screenshot loop.
+                scan_interval = max(MIN_AUTO_SCAN_INTERVAL, float(config.auto_scan_interval_seconds or 0))
                 seconds_since_last_ocr = time.perf_counter() - self.last_ocr_put_time
-                if config.auto_scan_mode and seconds_since_last_ocr < config.auto_scan_interval_seconds:
+                if config.auto_scan_mode and seconds_since_last_ocr < scan_interval:
                     logger.debug(
-                        f"...{seconds_since_last_ocr:.2f}s since last ocr, sleeping for another {config.auto_scan_interval_seconds - seconds_since_last_ocr:.2f}s")
-                    self._sleep_and_handle_loop_exit(config.auto_scan_interval_seconds - seconds_since_last_ocr)
+                        f"...{seconds_since_last_ocr:.2f}s since last ocr, sleeping for another {scan_interval - seconds_since_last_ocr:.2f}s")
+                    self._sleep_and_handle_loop_exit(scan_interval - seconds_since_last_ocr)
                     continue
 
                 # prevent ocr runs without mouse movements for auto-on-mouse-move mode
@@ -72,12 +82,17 @@ class ScreenManager(threading.Thread):
                 processing_duration = time.perf_counter() - start_time
                 logger.debug(f"Screenshot {screenshot.size} complete in {processing_duration:.2f}s")
 
-                if self.last_screenshot and self.last_screenshot.raw == screenshot.raw:
+                # Compare a sampled fingerprint instead of the full raw buffer.
+                # Raw is ~33 MB on 4K; a Python `==` does byte-wise compare on
+                # every tick, which on its own can dominate idle CPU usage.
+                screenshot_fp = content_fingerprint(screenshot.raw)
+                if self.last_screenshot is not None and self.last_screenshot_fp == screenshot_fp:
                     logger.debug(f"Screen content didnt change... skipping ocr")
                     self._sleep_and_handle_loop_exit(0.1)
                     continue
 
                 self.last_screenshot = screenshot
+                self.last_screenshot_fp = screenshot_fp
                 self.last_mouse_pos = self.input_loop.get_mouse_pos()
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
                 self.shared_state.ocr_queue.put(img)
@@ -121,6 +136,7 @@ class ScreenManager(threading.Thread):
 
     def force_screenshot_trigger(self):
         self.last_screenshot = None
+        self.last_screenshot_fp = None
         self.last_mouse_pos = None
 
     def _sleep_and_handle_loop_exit(self, interval):
