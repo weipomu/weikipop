@@ -441,11 +441,11 @@ class Popup(QWidget):
             return
         threading.Thread(
             target=self._add_to_anki_thread,
-            args=(entry, ctx),
+            args=(entry, ctx, entries),
             daemon=True
         ).start()
 
-    def _add_to_anki_thread(self, entry: DictionaryEntry, ctx: Dict[str, Any]):
+    def _add_to_anki_thread(self, entry: DictionaryEntry, ctx: Dict[str, Any], all_entries=None):
         """Runs in a background thread. Only emits signals to touch the UI."""
         anki = AnkiClient(getattr(config, "url", "http://127.0.0.1:8765"))
         if not anki.ping():
@@ -485,20 +485,46 @@ class Popup(QWidget):
                     pass
 
         # Build field map
+        senses = getattr(entry, "senses", []) or []
+
+        # Full glossary — every sense, all glosses, joined
         full_glossary = "<br>".join(
-            ", ".join(s.get("glosses", [])) for s in (getattr(entry, "senses", []) or [])
+            ", ".join(s.get("glosses", [])) for s in senses
         )
+        # Plain-text glossary (no HTML tags)
+        full_glossary_plain = "\n".join(
+            ", ".join(s.get("glosses", [])) for s in senses
+        )
+        # First gloss of the highest-priority (first) sense
         first_dict_glossary = ""
-        for s in (getattr(entry, "senses", []) or []):
+        for s in senses:
             glosses = s.get("glosses", [])
             if glosses:
                 first_dict_glossary = glosses[0]
                 break
+        # Part-of-speech: collect unique POS tags across all senses
+        pos_set: list = []
+        for s in senses:
+            for p in (s.get("pos", []) or []):
+                if p not in pos_set:
+                    pos_set.append(p)
+        part_of_speech_str = ", ".join(pos_set)
+
+        # Furigana variants
         furigana_plain = f"{word}[{reading}]" if (word and reading) else (word or reading)
+        # HTML ruby furigana: <ruby>word<rt>reading</rt></ruby>
+        furigana_html = (
+            f"<ruby>{word}<rt>{reading}</rt></ruby>"
+            if (word and reading) else (word or reading)
+        )
+
         freq_val = getattr(entry, "freq", 999999)
         freq_str = "" if freq_val >= 999999 else str(freq_val)
+
         tags_str = " ".join(sorted(getattr(entry, "tags", set()) or []))
         conj_str = " > ".join(getattr(entry, "deconjugation_process", ()) or ())
+        dict_name = getattr(entry, "dictionary_name", "") or ""
+
         # sentence split at cloze boundary (word position)
         cloze_prefix = ""
         cloze_suffix = ""
@@ -508,32 +534,110 @@ class Popup(QWidget):
                 cloze_prefix = sentence[:idx]
                 cloze_suffix = sentence[idx + len(word):]
 
+        # -------------------------------------------------------------------
+        # Build per-dictionary glossary maps from all candidate entries.
+        # Covers {single-glossary-DICT}, {single-glossary-DICT-brief},
+        # {single-glossary-DICT-no-dictionary}, and frequency variants.
+        # -------------------------------------------------------------------
+        single_glossary_by_dict: Dict[str, str] = {}
+        for e in (all_entries or [entry]):
+            if not isinstance(e, DictionaryEntry):
+                continue
+            dname = getattr(e, "dictionary_name", "") or ""
+            if not dname or dname in single_glossary_by_dict:
+                continue
+            e_senses = getattr(e, "senses", []) or []
+            all_glosses = "<br>".join(
+                ", ".join(s.get("glosses", [])) for s in e_senses
+            )
+            single_glossary_by_dict[dname] = all_glosses
+
+        # -------------------------------------------------------------------
+        # Static marker table — every official Yomitan term-card marker.
+        # Unsupported markers are left blank so they expand to "" rather than
+        # being left as raw {placeholder} text on the card.
+        # -------------------------------------------------------------------
         data_sources = {
-            # Exact Yomitan marker names (from screenshots)
-            "{audio}":                    "",          # not supported; leave blank
-            "{cloze-prefix}":             cloze_prefix,
-            "{cloze-suffix}":             cloze_suffix,
-            "{document-title}":           ctx.get("document_title", ""),
-            "{expression}":               word,
-            "{frequencies}":              freq_str,
-            "{frequency-average-rank}":   freq_str,
-            "{frequency-harmonic-rank}":  freq_str,
-            "{furigana-plain}":           furigana_plain,
-            "{glossary}":                 full_glossary,
-            "{glossary-brief}":           meaning_str,
-            "{glossary-first}":           meaning_str,
-            "{glossary-1st-dict}":        first_dict_glossary,
-            "{picture}":                  "",          # not supported; leave blank
-            "{pitch-accent-graphs}":      "",          # not supported; leave blank
-            "{pitch-accent-positions}":   "",          # not supported; leave blank
-            "{reading}":                  reading,
-            "{sentence}":                 sentence,
-            "{tags}":                     tags_str,
+            # ── audio / media ──────────────────────────────────────────────
+            "{audio}":                              "",   # injected separately via AnkiConnect
+            "{clipboard-image}":                    "",   # not available in desktop OCR context
+            "{clipboard-text}":                     "",   # not available
+            "{picture}":                            "",   # injected separately via screenshot logic
+            "{screenshot}":                         "",   # injected separately
+            # ── cloze ──────────────────────────────────────────────────────
+            "{cloze-body}":                         word,
+            "{cloze-body-kana}":                    reading,
+            "{cloze-prefix}":                       cloze_prefix,
+            "{cloze-suffix}":                       cloze_suffix,
+            # ── expression / reading ───────────────────────────────────────
+            "{expression}":                         word,
+            "{reading}":                            reading,
+            "{furigana}":                           furigana_html,
+            "{furigana-plain}":                     furigana_plain,
+            # ── glossary ───────────────────────────────────────────────────
+            "{glossary}":                           full_glossary,
+            "{glossary-brief}":                     meaning_str,
+            "{glossary-no-dictionary}":             full_glossary,
+            "{glossary-plain}":                     full_glossary_plain,
+            "{glossary-plain-no-dictionary}":       full_glossary_plain,
+            "{glossary-first}":                     first_dict_glossary,
+            "{glossary-first-brief}":               first_dict_glossary,
+            "{glossary-first-no-dictionary}":       first_dict_glossary,
+            # legacy / community aliases
+            "{glossary-1st-dict}":                  first_dict_glossary,
+            "{jpmn-primary-definition}":            first_dict_glossary,
+            # ── part of speech / conjugation ───────────────────────────────
+            "{part-of-speech}":                     part_of_speech_str,
+            "{conjugation}":                        conj_str,
+            "{tags}":                               tags_str,
+            # ── frequency ──────────────────────────────────────────────────
+            "{freq}":                               freq_str,   # community alias
+            "{frequencies}":                        freq_str,
+            "{frequency-harmonic-rank}":            freq_str,
+            "{frequency-average-rank}":             freq_str,
+            "{frequency-harmonic-occurrence}":      "",   # occurrence-based, not available
+            "{frequency-average-occurrence}":       "",
+            # ── pitch accent (not supported) ───────────────────────────────
+            "{pitch-accents}":                      "",
+            "{pitch-accent-graphs}":                "",
+            "{pitch-accent-graphs-jj}":             "",
+            "{pitch-accent-positions}":             "",
+            "{pitch-accent-categories}":            "",
+            "{phonetic-transcriptions}":            "",
+            # ── dictionary meta ────────────────────────────────────────────
+            "{dictionary}":                         dict_name,
+            "{dictionary-alias}":                   dict_name,
+            # ── sentence / context ─────────────────────────────────────────
+            "{sentence}":                           sentence,
+            "{sentence-furigana}":                  sentence,   # furigana generation not available
+            "{sentence-furigana-plain}":            sentence,
+            "{search-query}":                       sentence,
+            "{popup-selection-text}":               "",
+            "{selection-text}":                     "",   # animecards alias
+            # ── page context ───────────────────────────────────────────────
+            "{document-title}":                     ctx.get("document_title", ""),
+            "{url}":                                "",   # no browser context
         }
+
+        # Inject per-dictionary single-glossary variants for every loaded dict
+        for dname, gloss in single_glossary_by_dict.items():
+            data_sources[f"{{single-glossary-{dname}}}"]              = gloss
+            data_sources[f"{{single-glossary-{dname}-brief}}"]        = gloss
+            data_sources[f"{{single-glossary-{dname}-no-dictionary}}"] = gloss
+            # Frequency variants per dict — not available, leave blank
+            data_sources[f"{{single-frequency-{dname}}}"]             = ""
+            data_sources[f"{{single-frequency-number-{dname}}}"]      = ""
+
+        def _resolve_template(template: str) -> str:
+            """Replace every known {placeholder} within a field template string."""
+            result = template
+            for placeholder, value in data_sources.items():
+                result = result.replace(placeholder, value or "")
+            return result
 
         user_map = getattr(config, "anki_field_map", {}) or {}
         if user_map:
-            fields = {k: data_sources.get(v, str(v)) for k, v in user_map.items() if v}
+            fields = {k: _resolve_template(v) for k, v in user_map.items() if v}
         else:
             fields = {"Front": word or reading, "Back": meaning_str}
 
