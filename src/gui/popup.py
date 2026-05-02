@@ -562,8 +562,8 @@ class Popup(QWidget):
             "{audio}":                              "",   # injected separately via AnkiConnect
             "{clipboard-image}":                    "",   # not available in desktop OCR context
             "{clipboard-text}":                     "",   # not available
-            "{picture}":                            "",   # injected separately via screenshot logic
-            "{screenshot}":                         "",   # injected separately
+            "{picture}":                            "",   # replaced by screenshot injection below
+            "{screenshot}":                         "",   # replaced by screenshot injection below
             # ── cloze ──────────────────────────────────────────────────────
             "{cloze-body}":                         word,
             "{cloze-body-kana}":                    reading,
@@ -668,11 +668,12 @@ class Popup(QWidget):
                 anki.store_media_file(fname, b64)
                 img_tag = f'<img src="{fname}">'
 
-                # Insert into whichever field the user mapped to {picture},
-                # OR any field whose name suggests it holds images.
+                # Insert into whichever field the user mapped to {picture} or
+                # {screenshot}, OR any field whose name suggests it holds images.
                 field_map = getattr(config, "anki_field_map", {}) or {}
                 pic_anki_field = next(
-                    (af for af, src in field_map.items() if src == "{picture}"), None
+                    (af for af, src in field_map.items()
+                     if src in ("{picture}", "{screenshot}")), None
                 )
                 if pic_anki_field and pic_anki_field in note["fields"]:
                     note["fields"][pic_anki_field] = img_tag
